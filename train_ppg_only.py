@@ -595,7 +595,7 @@ def main():
     args = parse_args()
 
     # 加载配置
-    with open(args.config, 'r') as f:
+    with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     # 命令行参数覆盖
