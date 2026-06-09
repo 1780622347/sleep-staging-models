@@ -74,14 +74,14 @@ class MultiModalTrainer:
         return model.to(self.device)
 
     def calculate_class_weights(self, train_dataset):
-
+        # 类别权重计算：处理睡眠分类中的类别不平衡的问题
         print("\nCalculating class weights...")
 
 
         all_labels = []
 
 
-        sample_size = min(len(train_dataset), 50)
+        sample_size = min(len(train_dataset), 50) # 采集最多50个样本
 
         for idx in tqdm(range(sample_size), desc="Sampling labels"):
 
@@ -96,14 +96,14 @@ class MultiModalTrainer:
             all_labels.extend(valid_labels.numpy().tolist())
 
 
-        label_counts = Counter(all_labels)
+        label_counts = Counter(all_labels)  
 
 
         class_counts = []
         for i in range(4):
             class_counts.append(label_counts.get(i, 1))
 
-        total_samples = sum(class_counts)
+        total_samples = sum(class_counts) # 统计各类别样本数
 
  
         print(f"\nLabel distribution (from {sample_size} subjects):")

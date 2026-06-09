@@ -1,0 +1,43 @@
+# config_ppg_unfiltered_dreamt.yaml
+# Configuration for training PPG + Unfiltered PPG model on DREAMT dataset
+
+# 数据配置 - 指向extract_dreamt_data.py生成的文件
+data:
+  ppg_file: "./dreamt_processed/dreamt_ppg_with_labels.h5"
+  index_file: "./dreamt_processed/dreamt_subject_index.h5"
+  batch_size: 2
+  num_workers: 0
+
+# 训练配置
+training:
+  batch_size: 2
+  num_epochs: 50
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  patience: 15
+
+# 模型配置
+model:
+  d_model: 256
+  n_heads: 8
+  n_fusion_blocks: 3
+
+# 噪声配置 (模型内部生成噪声PPG)
+noise_config:
+  noise_level: 0.1
+  drift_amplitude: 0.1
+  drift_frequency: 0.1
+  spike_probability: 0.01
+  spike_amplitude: 0.5
+
+# 输出配置
+output:
+  save_dir: "./outputs_dreamt"
+  save_frequency: 5
+
+# GPU配置
+gpu:
+  device_id: 0
+
+# 混合精度训练
+use_amp: true
