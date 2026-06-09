@@ -1,0 +1,41 @@
+# DREAMT数据集训练配置
+# 使用extract_dreamt_data.py生成的数据
+
+data:
+  # DREAMT处理后的数据文件路径
+  ppg_file: "./dreamt_processed/dreamt_ppg_with_labels.h5"
+  ecg_file: "./dreamt_processed/dreamt_ecg.h5"
+  index_file: "./dreamt_processed/dreamt_subject_index.h5"
+  
+  batch_size: 2
+  num_workers: 4
+
+training:
+  num_epochs: 50
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  patience: 10
+  
+  # DREAMT数据集不使用SleepPPG-Net预定义测试集
+  # 系统将自动按8:1:1比例划分训练/验证/测试集
+  use_sleepppg_test_set: false
+  
+  num_runs: 5
+
+model:
+  ppg_only:
+    enabled: true
+  real_ecg:
+    enabled: true
+    fusion_strategy: "attention"
+  generated_ecg:
+    enabled: false
+
+output:
+  save_dir: "./outputs_dreamt"
+  save_frequency: 5
+  save_intermediate: true
+
+gpu:
+  device_id: 0
+  mixed_precision: false
