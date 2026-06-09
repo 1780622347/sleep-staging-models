@@ -138,26 +138,26 @@ class MESADataExtractor:
         cutoff = 8 / nyq
 
 
-        sos = signal.cheby2(N=8, rs=40, Wn=cutoff, btype='lowpass', output='sos')
+        sos = signal.cheby2(N=8, rs=40, Wn=cutoff, btype='lowpass', output='sos') # 8hz低通滤波（抗混叠滤波避免后续下采样失真）
         filtered_ppg = signal.sosfiltfilt(sos, ppg_signal)
 
 
-        duration = len(filtered_ppg) / original_fs  
-        n_samples = int(duration * self.target_fs)
+        duration = len(filtered_ppg) / original_fs  # 原始信号的时长（s）
+        n_samples = int(duration * self.target_fs)  # 计算采样之后的样本点，并取整
 
-
-        old_indices = np.linspace(0, len(filtered_ppg) - 1, len(filtered_ppg))
-        new_indices = np.linspace(0, len(filtered_ppg) - 1, n_samples)
-        downsampled_ppg = np.interp(new_indices, old_indices, filtered_ppg)
+        # 重采样：从原始采样率到34.13hz
+        old_indices = np.linspace(0, len(filtered_ppg) - 1, len(filtered_ppg)) # 原始信号的索引：从0到len-1
+        new_indices = np.linspace(0, len(filtered_ppg) - 1, n_samples) # 采样后信号的新索引
+        downsampled_ppg = np.interp(new_indices, old_indices, filtered_ppg) # 线性插值
 
 
         mean = np.mean(downsampled_ppg)
         std = np.std(downsampled_ppg)
 
-
+        # 对ppg限制范围在 mean ± 3*std 之间
         clipped_ppg = np.clip(downsampled_ppg, mean - 3 * std, mean + 3 * std)
 
-
+        # z-score标准化
         wavppg = (clipped_ppg - np.mean(clipped_ppg)) / np.std(clipped_ppg)
 
         return wavppg
@@ -172,7 +172,7 @@ class MESADataExtractor:
             high = 0.99
 
 
-        b, a = butter(4, [low, high], btype='band')
+        b, a = butter(4, [low, high], btype='band') # 0.5-40hz的带通
         filtered_ecg = filtfilt(b, a, ecg_signal)
 
 
@@ -209,7 +209,7 @@ class MESADataExtractor:
             return np.concatenate([signal, padding])
 
     def parse_sleep_stages(self, xml_file):
-
+        """睡眠分期标签解析 """
         try:
             tree = ET.parse(xml_file)
             root = tree.getroot()
@@ -229,7 +229,7 @@ class MESADataExtractor:
                     start_time = float(event.find('Start').text)
                     duration = float(event.find('Duration').text)
 
-
+                    # 标签映射，四分类
                     if 'Wake' in event_concept:
                         stage = 0
                     elif 'Stage 1 sleep' in event_concept or 'Stage 2 sleep' in event_concept:
@@ -254,6 +254,7 @@ class MESADataExtractor:
             return None
 
     def expand_labels_to_windows(self, df_stages, total_duration):
+        """将事件级别的标签扩展到30s窗口级别"""
 
         num_windows = int(np.ceil(total_duration / self.window_duration))
         labels = np.full(num_windows, -1, dtype=int) 
@@ -283,7 +284,7 @@ class MESADataExtractor:
             return np.concatenate([labels, padding])
 
     def process_subject(self, edf_file, xml_file):
-
+        """处理单被试：输出ppg和ecg窗口数据、对应的标签"""
         ppg, ecg, ppg_fs, ecg_fs = self.extract_signals_from_edf(edf_file)
 
         if ppg is None:
@@ -300,7 +301,7 @@ class MESADataExtractor:
             ecg_processed = np.zeros_like(ppg_processed)
 
 
-        ppg_final = self.pad_or_truncate_signal(ppg_processed, self.target_length)
+        ppg_final = self.pad_or_truncate_signal(ppg_processed, self.target_length) # 填充/截断到目标长度
         ecg_final = self.pad_or_truncate_signal(ecg_processed, self.target_length)
 
 
