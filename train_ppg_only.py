@@ -363,7 +363,7 @@ class MultiModalTrainer:
                 batch_size=self.config['data']['batch_size'],
                 num_workers=self.config['data']['num_workers'],
                 model_type='ppg_only',
-                use_sleepppg_test_set=self.config['training']['use_sleepppg_test_set']
+                use_sleepppg_test_set=self.config['data'].get('use_sleepppg_test_set', True)
             )
         else:
             data_paths['real_ecg'] = self.config['data']['ecg_file']
@@ -373,7 +373,7 @@ class MultiModalTrainer:
                 num_workers=self.config['data']['num_workers'],
                 model_type='multimodal',
                 use_generated_ecg=False,
-                use_sleepppg_test_set=self.config['training']['use_sleepppg_test_set']
+                use_sleepppg_test_set=self.config['data'].get('use_sleepppg_test_set', True)
             )
 
         # 创建模型

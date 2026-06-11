@@ -3,6 +3,7 @@ train_ppg_unfiltered.py
 PPG + Unfiltered PPG training script
 Validates whether Cross-Attention mechanism can extract useful information from noisy signals
 """
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -320,7 +321,7 @@ class PPGUnfilteredTrainer(CrossAttentionTrainer):
             batch_size=self.config['training']['batch_size'],
             num_workers=self.config['data']['num_workers'],
             model_type='ppg_only',
-            use_sleepppg_test_set=True
+            use_sleepppg_test_set=self.config['data'].get('use_sleepppg_test_set', True)
         )
 
         # Create model

@@ -337,7 +337,7 @@ class CrossAttentionTrainer:
             batch_size=self.config['training']['batch_size'],
             num_workers=self.config['data']['num_workers'],
             model_type='multimodal',
-            use_sleepppg_test_set=True
+            use_sleepppg_test_set=self.config['data'].get('use_sleepppg_test_set', True)
         )
 
         # Create model
@@ -639,7 +639,7 @@ def main():
 
     # Load configuration
     if os.path.exists(args.config):
-        with open(args.config, 'r') as f:
+        with open(args.config, 'r',encoding="utf-8") as f:
             config = yaml.safe_load(f)
     else:
         # Default configuration

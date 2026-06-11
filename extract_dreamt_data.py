@@ -33,9 +33,15 @@ class DREAMTDataExtractor:
         self.target_windows = 1200  # 目标窗口数
         self.target_length = self.target_windows * self.samples_per_window  # 1,228,800 samples
         
-        # DREAMT数据采样率
-        self.ppg_fs = 64  # BVP采样率
-        self.ecg_fs = 100 if use_100hz else None  # ECG采样率（仅100Hz数据有）
+        # DREAMT数据采样率（根据数据目录不同）
+        # 100Hz目录：所有信号已重采样到100Hz
+        # 64Hz目录：BVP原始64Hz，无ECG
+        if use_100hz:
+            self.ppg_fs = 100  # 100Hz目录中BVP已重采样到100Hz
+            self.ecg_fs = 100  # ECG采样率100Hz
+        else:
+            self.ppg_fs = 64   # 64Hz目录中BVP原始64Hz
+            self.ecg_fs = None # 64Hz目录无ECG
         
         # 标签映射（DREAMT标签 -> 4分类）
         self.stage_map = {
