@@ -388,14 +388,17 @@ class CrossAttentionTrainerDDP:
         # Create datasets
         from multimodal_dataset_aligned import MultiModalSleepDataset, PPGOnlyDataset
 
+        # 从配置文件读取use_sleepppg_test_set，默认为True
+        use_sleepppg_test_set = self.config['data'].get('use_sleepppg_test_set', True)
+
         train_dataset = MultiModalSleepDataset(
-            data_paths, split='train', use_sleepppg_test_set=True
+            data_paths, split='train', use_sleepppg_test_set=use_sleepppg_test_set
         )
         val_dataset = MultiModalSleepDataset(
-            data_paths, split='val', use_sleepppg_test_set=True
+            data_paths, split='val', use_sleepppg_test_set=use_sleepppg_test_set
         )
         test_dataset = MultiModalSleepDataset(
-            data_paths, split='test', use_sleepppg_test_set=True
+            data_paths, split='test', use_sleepppg_test_set=use_sleepppg_test_set
         )
 
         # Create distributed sampler
@@ -444,7 +447,8 @@ class CrossAttentionTrainerDDP:
         ).to(self.device)
 
         # Wrap model with DDP
-        model = DDP(model, device_ids=[self.rank], output_device=self.rank)
+        # model = DDP(model, device_ids=[self.rank], output_device=self.rank)
+        model = model.cuda()
 
         if self.rank == 0:
             print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -757,7 +761,7 @@ def main():
     args = parser.parse_args()
 
     # Load configuration
-    with open(args.config, 'r') as f:
+    with open(args.config, 'r',encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     # Set GPU count
