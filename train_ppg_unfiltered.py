@@ -23,7 +23,7 @@ import gc
 from collections import Counter, defaultdict
 
 from ppg_unfiltered_crossattn import PPGUnfilteredCrossAttention
-from multimodal_dataset_aligned import get_dataloaders
+from multimodal_dataset_aligned import get_dataloaders, get_loso_dataloaders, get_all_subjects
 from train_crossattn import CrossAttentionTrainer
 
 
@@ -587,13 +587,212 @@ class PPGUnfilteredTrainer(CrossAttentionTrainer):
         plt.close()
 
 
+class LOSOTrainer(PPGUnfilteredTrainer):
+    """Leave-One-Subject-Out Cross Validation Trainer"""
+    
+    def __init__(self, config, test_subject=None, fold_id=None):
+        self.test_subject = test_subject
+        self.fold_id = fold_id
+        super().__init__(config, run_id=fold_id)
+    
+    def update_directories(self):
+        """Update directory names for LOSO-CV"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        if self.test_subject:
+            model_name = f"ppg_unfiltered_loso_{self.test_subject}"
+        else:
+            model_name = f"ppg_unfiltered_loso_{timestamp}"
+        
+        if self.fold_id is not None:
+            model_name += f"_fold{self.fold_id}"
+        
+        self.output_dir = os.path.join(self.config['output']['save_dir'], model_name)
+        self.checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')
+        self.log_dir = os.path.join(self.output_dir, 'logs')
+        self.results_dir = os.path.join(self.output_dir, 'results')
+        
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.results_dir, exist_ok=True)
+    
+    def train_loso(self, test_subject):
+        """Train with LOSO-CV for a specific test subject"""
+        print(f"\n{'=' * 60}")
+        print(f"Training PPG + Unfiltered PPG Model (LOSO-CV)")
+        print(f"Test Subject: {test_subject}")
+        print(f"{'=' * 60}")
+        
+        self.test_subject = test_subject
+        self.update_directories()
+        
+        # Prepare data paths
+        data_paths = {
+            'ppg': self.config['data']['ppg_file'],
+            'index': self.config['data']['index_file']
+        }
+        
+        # Create LOSO data loaders
+        train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset = get_loso_dataloaders(
+            data_paths,
+            test_subject=test_subject,
+            batch_size=self.config['training']['batch_size'],
+            num_workers=self.config['data']['num_workers'],
+            val_ratio=self.config['training'].get('val_ratio', 0.2),
+            seed=self.config['training'].get('seed', 42)
+        )
+        
+        # Create model
+        model = PPGUnfilteredCrossAttention(
+            n_classes=4,
+            d_model=self.config['model']['d_model'],
+            n_heads=self.config['model']['n_heads'],
+            n_fusion_blocks=self.config['model']['n_fusion_blocks'],
+            noise_config=self.config.get('noise_config', None)
+        ).to(self.device)
+        
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+        
+        # Calculate class weights
+        class_weights = self.calculate_class_weights(train_dataset)
+        criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1)
+        
+        # Optimizer
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=self.config['training']['learning_rate'],
+            weight_decay=self.config['training']['weight_decay']
+        )
+        
+        # Learning rate schedule
+        total_steps = len(train_loader) * self.config['training']['num_epochs']
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.config['training']['learning_rate'],
+            total_steps=total_steps,
+            pct_start=0.1,
+            anneal_strategy='cos'
+        )
+        
+        # Training loop
+        best_kappa = 0
+        best_epoch = 0
+        patience_counter = 0
+        
+        train_losses = []
+        val_losses = []
+        val_overall_kappas = []
+        val_median_kappas = []
+        
+        for epoch in range(1, self.config['training']['num_epochs'] + 1):
+            print(f"\n{'=' * 50}")
+            print(f"Epoch {epoch}/{self.config['training']['num_epochs']}")
+            print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
+            
+            # Train
+            train_loss, train_acc = self.train_epoch(
+                model, train_loader, optimizer, criterion, scheduler, epoch
+            )
+            train_losses.append(train_loss)
+            
+            # Validate
+            val_results = self.validate(model, val_loader, criterion)
+            val_losses.append(val_results['loss'])
+            val_overall_kappas.append(val_results['overall_kappa'])
+            val_median_kappas.append(val_results['median_kappa'])
+            
+            print(f"\nTrain Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+            print(f"Val Loss: {val_results['loss']:.4f}")
+            print(f"Val Overall - Acc: {val_results['overall_accuracy']:.4f}, "
+                  f"Kappa: {val_results['overall_kappa']:.4f}, F1: {val_results['overall_f1']:.4f}")
+            
+            # Save best model
+            if val_results['overall_kappa'] > best_kappa:
+                best_kappa = val_results['overall_kappa']
+                best_epoch = epoch
+                patience_counter = 0
+                
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'best_overall_kappa': best_kappa,
+                    'config': self.config,
+                    'test_subject': test_subject
+                }
+                
+                best_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
+                torch.save(checkpoint, best_path)
+                print(f"Saved best model with overall kappa: {best_kappa:.4f}")
+            else:
+                patience_counter += 1
+            
+            # Early stopping
+            if patience_counter >= self.config['training']['patience']:
+                print(f"\nEarly stopping at epoch {epoch}")
+                break
+            
+            # Memory cleanup
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        print(f"\nBest validation overall kappa: {best_kappa:.4f} at epoch {best_epoch}")
+        
+        # Test on test set (the left-out subject)
+        print("\n" + "=" * 60)
+        print(f"Evaluating on test set (Subject: {test_subject})...")
+        print("=" * 60)
+        
+        # Load best model
+        checkpoint = torch.load(os.path.join(self.checkpoint_dir, 'best_model.pth'))
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Test
+        test_results = self.validate(model, test_loader, criterion)
+        
+        print(f"\nTest Results for Subject {test_subject}:")
+        print(f"  Loss: {test_results['loss']:.4f}")
+        print(f"  Overall - Acc: {test_results['overall_accuracy']:.4f}, "
+              f"Kappa: {test_results['overall_kappa']:.4f}, F1: {test_results['overall_f1']:.4f}")
+        
+        # Save results
+        results = {
+            'model': 'PPG + Unfiltered PPG Cross-Attention (LOSO-CV)',
+            'test_subject': test_subject,
+            'test_accuracy_overall': test_results['overall_accuracy'],
+            'test_kappa_overall': test_results['overall_kappa'],
+            'test_f1_overall': test_results['overall_f1'],
+            'test_loss': test_results['loss'],
+            'best_epoch': best_epoch,
+            'confusion_matrix': test_results['confusion_matrix'].tolist(),
+            'per_class_metrics': {
+                'precision': test_results['per_class_metrics']['precision'].tolist(),
+                'recall': test_results['per_class_metrics']['recall'].tolist(),
+                'f1': test_results['per_class_metrics']['f1'].tolist()
+            },
+            'config': self.config
+        }
+        
+        with open(os.path.join(self.results_dir, 'test_results.json'), 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        self.writer.close()
+        
+        return results
+
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train PPG + Unfiltered PPG Model')
     parser.add_argument('--config', type=str, default='config_ppg_unfiltered.yaml',
                         help='Path to configuration file')
+    parser.add_argument('--mode', type=str, default='loso', choices=['loso', 'multi_run'],
+                        help='Training mode: loso (Leave-One-Subject-Out) or multi_run')
     parser.add_argument('--runs', type=int, default=5,
-                        help='Number of runs')
+                        help='Number of runs (for multi_run mode)')
+    parser.add_argument('--subjects', type=str, default=None,
+                        help='Comma-separated list of test subjects for LOSO-CV (default: all subjects)')
+    parser.add_argument('--val_ratio', type=float, default=0.2,
+                        help='Validation ratio for LOSO-CV')
     args = parser.parse_args()
 
     # Load configuration
@@ -613,7 +812,9 @@ def main():
                 'num_epochs': 50,
                 'learning_rate': 1e-4,
                 'weight_decay': 1e-5,
-                'patience': 15
+                'patience': 15,
+                'val_ratio': 0.2,
+                'seed': 42
             },
             'model': {
                 'd_model': 256,
@@ -633,120 +834,247 @@ def main():
             },
             'use_amp': True
         }
+    
+    # Update config with command line arguments
+    config['training']['val_ratio'] = args.val_ratio
 
-    # Multiple runs
-    n_runs = args.runs
-    all_results = []
-
-    for run in range(1, n_runs + 1):
-        print(f"\n{'=' * 80}")
-        print(f"RUN {run}/{n_runs}")
-        print('=' * 80)
-
-        # Set random seeds
-        torch.manual_seed(42 + run)
-        np.random.seed(42 + run)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(42 + run)
-
-        # Train
-        trainer = PPGUnfilteredTrainer(config, run_id=run)
-        results = trainer.train()
-        all_results.append(results)
-
-        # Memory cleanup
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    # Summarize results
-    print("\n" + "=" * 80)
-    print(f"FINAL RESULTS ({n_runs} runs)")
-    print("=" * 80)
-
-    # Overall metrics
-    overall_accuracies = [r['test_accuracy_overall'] for r in all_results]
-    overall_kappas = [r['test_kappa_overall'] for r in all_results]
-    overall_f1_scores = [r['test_f1_overall'] for r in all_results]
-
-    # Median metrics
-    median_accuracies = [r['test_accuracy_median'] for r in all_results]
-    median_kappas = [r['test_kappa_median'] for r in all_results]
-    median_f1_scores = [r['test_f1_median'] for r in all_results]
-
-    print(f"\nPPG + Unfiltered PPG Cross-Attention Model:")
-    print(f"\nOverall Metrics:")
-    print(f"  Accuracy: {np.median(overall_accuracies):.4f} (median), "
-          f"{np.mean(overall_accuracies):.4f}±{np.std(overall_accuracies):.4f} (mean±std)")
-    print(f"  Kappa: {np.median(overall_kappas):.4f} (median), "
-          f"{np.mean(overall_kappas):.4f}±{np.std(overall_kappas):.4f} (mean±std)")
-    print(f"  F1 Score: {np.median(overall_f1_scores):.4f} (median), "
-          f"{np.mean(overall_f1_scores):.4f}±{np.std(overall_f1_scores):.4f} (mean±std)")
-
-    print(f"\nPer-Patient Median Metrics:")
-    print(f"  Accuracy: {np.median(median_accuracies):.4f} (median), "
-          f"{np.mean(median_accuracies):.4f}±{np.std(median_accuracies):.4f} (mean±std)")
-    print(f"  Kappa: {np.median(median_kappas):.4f} (median), "
-          f"{np.mean(median_kappas):.4f}±{np.std(median_kappas):.4f} (mean±std)")
-    print(f"  F1 Score: {np.median(median_f1_scores):.4f} (median), "
-          f"{np.mean(median_f1_scores):.4f}±{np.std(median_f1_scores):.4f} (mean±std)")
-
-    print(f"\nAll overall kappas: {[f'{k:.4f}' for k in overall_kappas]}")
-    print(f"All median kappas: {[f'{k:.4f}' for k in median_kappas]}")
-
-    # Save summary results
-    summary_results = {
-        'model': 'PPG + Unfiltered PPG Cross-Attention',
-        'num_runs': n_runs,
-        'overall_metrics': {
-            'accuracy': {
-                'median': float(np.median(overall_accuracies)),
-                'mean': float(np.mean(overall_accuracies)),
-                'std': float(np.std(overall_accuracies)),
-                'all': overall_accuracies
+    if args.mode == 'loso':
+        # Leave-One-Subject-Out Cross Validation
+        print("\n" + "=" * 80)
+        print("Leave-One-Subject-Out Cross Validation (LOSO-CV)")
+        print("=" * 80)
+        
+        # Get all valid subjects
+        data_paths = {
+            'ppg': config['data']['ppg_file'],
+            'index': config['data']['index_file']
+        }
+        
+        all_subjects = get_all_subjects(data_paths)
+        print(f"\nTotal valid subjects: {len(all_subjects)}")
+        
+        # Parse specific subjects if provided
+        if args.subjects:
+            test_subjects = [s.strip() for s in args.subjects.split(',')]
+            # Validate subjects
+            invalid = [s for s in test_subjects if s not in all_subjects]
+            if invalid:
+                print(f"Warning: Invalid subjects: {invalid}")
+                test_subjects = [s for s in test_subjects if s in all_subjects]
+        else:
+            test_subjects = all_subjects
+        
+        print(f"Subjects for LOSO-CV: {len(test_subjects)}")
+        print(f"Subject list: {test_subjects[:10]}..." if len(test_subjects) > 10 else f"Subject list: {test_subjects}")
+        
+        # LOSO-CV training
+        all_results = []
+        
+        for fold_idx, test_subject in enumerate(test_subjects, 1):
+            print(f"\n{'=' * 80}")
+            print(f"FOLD {fold_idx}/{len(test_subjects)} - Test Subject: {test_subject}")
+            print('=' * 80)
+            
+            # Set random seed for reproducibility
+            seed = config['training'].get('seed', 42)
+            torch.manual_seed(seed + fold_idx)
+            np.random.seed(seed + fold_idx)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed + fold_idx)
+            
+            # Train
+            trainer = LOSOTrainer(config, test_subject=test_subject, fold_id=fold_idx)
+            results = trainer.train_loso(test_subject)
+            results['fold_idx'] = fold_idx
+            all_results.append(results)
+            
+            # Memory cleanup
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        # Summarize LOSO-CV results
+        print("\n" + "=" * 80)
+        print(f"LOSO-CV FINAL RESULTS ({len(test_subjects)} folds)")
+        print("=" * 80)
+        
+        # Collect metrics
+        overall_accuracies = [r['test_accuracy_overall'] for r in all_results]
+        overall_kappas = [r['test_kappa_overall'] for r in all_results]
+        overall_f1_scores = [r['test_f1_overall'] for r in all_results]
+        
+        # Print per-subject results
+        print("\nPer-Subject Results:")
+        print(f"{'Subject':<10} {'Accuracy':>10} {'Kappa':>10} {'F1':>10}")
+        print("-" * 42)
+        for r in all_results:
+            print(f"{r['test_subject']:<10} {r['test_accuracy_overall']:>10.4f} "
+                  f"{r['test_kappa_overall']:>10.4f} {r['test_f1_overall']:>10.4f}")
+        print("-" * 42)
+        
+        print(f"\nLOSO-CV Summary:")
+        print(f"  Accuracy: {np.mean(overall_accuracies):.4f} ± {np.std(overall_accuracies):.4f}")
+        print(f"  Kappa: {np.mean(overall_kappas):.4f} ± {np.std(overall_kappas):.4f}")
+        print(f"  F1 Score: {np.mean(overall_f1_scores):.4f} ± {np.std(overall_f1_scores):.4f}")
+        print(f"\n  Median Kappa: {np.median(overall_kappas):.4f}")
+        print(f"  Min Kappa: {np.min(overall_kappas):.4f} (Subject: {all_results[np.argmin(overall_kappas)]['test_subject']})")
+        print(f"  Max Kappa: {np.max(overall_kappas):.4f} (Subject: {all_results[np.argmax(overall_kappas)]['test_subject']})")
+        
+        # Save summary
+        summary_results = {
+            'model': 'PPG + Unfiltered PPG Cross-Attention (LOSO-CV)',
+            'mode': 'loso_cv',
+            'num_folds': len(test_subjects),
+            'subjects': test_subjects,
+            'summary_metrics': {
+                'accuracy': {
+                    'mean': float(np.mean(overall_accuracies)),
+                    'std': float(np.std(overall_accuracies)),
+                    'median': float(np.median(overall_accuracies)),
+                    'min': float(np.min(overall_accuracies)),
+                    'max': float(np.max(overall_accuracies))
+                },
+                'kappa': {
+                    'mean': float(np.mean(overall_kappas)),
+                    'std': float(np.std(overall_kappas)),
+                    'median': float(np.median(overall_kappas)),
+                    'min': float(np.min(overall_kappas)),
+                    'max': float(np.max(overall_kappas))
+                },
+                'f1_score': {
+                    'mean': float(np.mean(overall_f1_scores)),
+                    'std': float(np.std(overall_f1_scores)),
+                    'median': float(np.median(overall_f1_scores)),
+                    'min': float(np.min(overall_f1_scores)),
+                    'max': float(np.max(overall_f1_scores))
+                }
             },
-            'kappa': {
-                'median': float(np.median(overall_kappas)),
-                'mean': float(np.mean(overall_kappas)),
-                'std': float(np.std(overall_kappas)),
-                'all': overall_kappas
+            'per_subject_results': all_results,
+            'config': config
+        }
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        summary_path = os.path.join(config['output']['save_dir'],
+                                    f'ppg_unfiltered_loso_summary_{timestamp}.json')
+        with open(summary_path, 'w') as f:
+            json.dump(summary_results, f, indent=2)
+        
+        print(f"\nSummary results saved to: {summary_path}")
+    
+    else:
+        # Original multi-run mode
+        n_runs = args.runs
+        all_results = []
+        
+        for run in range(1, n_runs + 1):
+            print(f"\n{'=' * 80}")
+            print(f"RUN {run}/{n_runs}")
+            print('=' * 80)
+            
+            # Set random seeds
+            torch.manual_seed(42 + run)
+            np.random.seed(42 + run)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(42 + run)
+            
+            # Train
+            trainer = PPGUnfilteredTrainer(config, run_id=run)
+            results = trainer.train()
+            all_results.append(results)
+            
+            # Memory cleanup
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        # Summarize results
+        print("\n" + "=" * 80)
+        print(f"FINAL RESULTS ({n_runs} runs)")
+        print("=" * 80)
+        
+        # Overall metrics
+        overall_accuracies = [r['test_accuracy_overall'] for r in all_results]
+        overall_kappas = [r['test_kappa_overall'] for r in all_results]
+        overall_f1_scores = [r['test_f1_overall'] for r in all_results]
+        
+        # Median metrics
+        median_accuracies = [r['test_accuracy_median'] for r in all_results]
+        median_kappas = [r['test_kappa_median'] for r in all_results]
+        median_f1_scores = [r['test_f1_median'] for r in all_results]
+        
+        print(f"\nPPG + Unfiltered PPG Cross-Attention Model:")
+        print(f"\nOverall Metrics:")
+        print(f"  Accuracy: {np.median(overall_accuracies):.4f} (median), "
+              f"{np.mean(overall_accuracies):.4f}±{np.std(overall_accuracies):.4f} (mean±std)")
+        print(f"  Kappa: {np.median(overall_kappas):.4f} (median), "
+              f"{np.mean(overall_kappas):.4f}±{np.std(overall_kappas):.4f} (mean±std)")
+        print(f"  F1 Score: {np.median(overall_f1_scores):.4f} (median), "
+              f"{np.mean(overall_f1_scores):.4f}±{np.std(overall_f1_scores):.4f} (mean±std)")
+        
+        print(f"\nPer-Patient Median Metrics:")
+        print(f"  Accuracy: {np.median(median_accuracies):.4f} (median), "
+              f"{np.mean(median_accuracies):.4f}±{np.std(median_accuracies):.4f} (mean±std)")
+        print(f"  Kappa: {np.median(median_kappas):.4f} (median), "
+              f"{np.mean(median_kappas):.4f}±{np.std(median_kappas):.4f} (mean±std)")
+        print(f"  F1 Score: {np.median(median_f1_scores):.4f} (median), "
+              f"{np.mean(median_f1_scores):.4f}±{np.std(median_f1_scores):.4f} (mean±std)")
+        
+        print(f"\nAll overall kappas: {[f'{k:.4f}' for k in overall_kappas]}")
+        print(f"All median kappas: {[f'{k:.4f}' for k in median_kappas]}")
+        
+        # Save summary results
+        summary_results = {
+            'model': 'PPG + Unfiltered PPG Cross-Attention',
+            'mode': 'multi_run',
+            'num_runs': n_runs,
+            'overall_metrics': {
+                'accuracy': {
+                    'median': float(np.median(overall_accuracies)),
+                    'mean': float(np.mean(overall_accuracies)),
+                    'std': float(np.std(overall_accuracies)),
+                    'all': overall_accuracies
+                },
+                'kappa': {
+                    'median': float(np.median(overall_kappas)),
+                    'mean': float(np.mean(overall_kappas)),
+                    'std': float(np.std(overall_kappas)),
+                    'all': overall_kappas
+                },
+                'f1_score': {
+                    'median': float(np.median(overall_f1_scores)),
+                    'mean': float(np.mean(overall_f1_scores)),
+                    'std': float(np.std(overall_f1_scores)),
+                    'all': overall_f1_scores
+                }
             },
-            'f1_score': {
-                'median': float(np.median(overall_f1_scores)),
-                'mean': float(np.mean(overall_f1_scores)),
-                'std': float(np.std(overall_f1_scores)),
-                'all': overall_f1_scores
-            }
-        },
-        'per_patient_median_metrics': {
-            'accuracy': {
-                'median': float(np.median(median_accuracies)),
-                'mean': float(np.mean(median_accuracies)),
-                'std': float(np.std(median_accuracies)),
-                'all': median_accuracies
+            'per_patient_median_metrics': {
+                'accuracy': {
+                    'median': float(np.median(median_accuracies)),
+                    'mean': float(np.mean(median_accuracies)),
+                    'std': float(np.std(median_accuracies)),
+                    'all': median_accuracies
+                },
+                'kappa': {
+                    'median': float(np.median(median_kappas)),
+                    'mean': float(np.mean(median_kappas)),
+                    'std': float(np.std(median_kappas)),
+                    'all': median_kappas
+                },
+                'f1_score': {
+                    'median': float(np.median(median_f1_scores)),
+                    'mean': float(np.mean(median_f1_scores)),
+                    'std': float(np.std(median_f1_scores)),
+                    'all': median_f1_scores
+                }
             },
-            'kappa': {
-                'median': float(np.median(median_kappas)),
-                'mean': float(np.mean(median_kappas)),
-                'std': float(np.std(median_kappas)),
-                'all': median_kappas
-            },
-            'f1_score': {
-                'median': float(np.median(median_f1_scores)),
-                'mean': float(np.mean(median_f1_scores)),
-                'std': float(np.std(median_f1_scores)),
-                'all': median_f1_scores
-            }
-        },
-        'all_runs': all_results
-    }
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    summary_path = os.path.join(config['output']['save_dir'],
-                                f'ppg_unfiltered_summary_{timestamp}.json')
-    with open(summary_path, 'w') as f:
-        json.dump(summary_results, f, indent=2)
-
-    print(f"\nSummary results saved to: {summary_path}")
+            'all_runs': all_results
+        }
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        summary_path = os.path.join(config['output']['save_dir'],
+                                    f'ppg_unfiltered_summary_{timestamp}.json')
+        with open(summary_path, 'w') as f:
+            json.dump(summary_results, f, indent=2)
+        
+        print(f"\nSummary results saved to: {summary_path}")
 
 
 if __name__ == "__main__":

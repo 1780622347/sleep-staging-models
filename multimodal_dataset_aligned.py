@@ -327,6 +327,193 @@ def get_dataloaders(data_path, batch_size=1, num_workers=0,
     return train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset
 
 
+class LOSO_PPGOnlyDataset(Dataset):
+    """Leave-One-Subject-Out Cross Validation Dataset for PPG only"""
+    
+    def __init__(self, data_path, split='train', test_subject=None, 
+                 val_ratio=0.2, transform=None, seed=42):
+        """
+        Args:
+            data_path: 数据路径字典 {'ppg': ..., 'index': ...}
+            split: 'train', 'val', 或 'test'
+            test_subject: 测试受试者ID (用于LOSO-CV)
+            val_ratio: 验证集比例
+            transform: 数据变换
+            seed: 随机种子
+        """
+        self.split = split
+        self.test_subject = test_subject
+        self.val_ratio = val_ratio
+        self.transform = transform
+        self.seed = seed
+        
+        self.windows_per_subject = 1200
+        self.samples_per_window = 1024
+        self.total_samples = self.windows_per_subject * self.samples_per_window
+        
+        # 数据路径
+        if isinstance(data_path, dict):
+            self.ppg_file_path = data_path['ppg']
+            self.index_file_path = data_path['index']
+        else:
+            self.ppg_file_path = os.path.join(data_path, 'mesa_ppg_with_labels.h5')
+            self.index_file_path = os.path.join(data_path, 'mesa_subject_index.h5')
+        
+        # 检查文件存在
+        if not os.path.exists(self.ppg_file_path):
+            raise FileNotFoundError(f"PPG file not found: {self.ppg_file_path}")
+        if not os.path.exists(self.index_file_path):
+            raise FileNotFoundError(f"Index file not found: {self.index_file_path}")
+        
+        print(f"Loading PPG data from: {self.ppg_file_path}")
+        
+        self._prepare_subjects()
+    
+    def _prepare_subjects(self):
+        """准备受试者划分"""
+        # 获取所有有效受试者
+        with h5py.File(self.index_file_path, 'r') as f:
+            all_subjects = list(f['subjects'].keys())
+            
+            valid_subjects = []
+            for subj in all_subjects:
+                n_windows = f[f'subjects/{subj}'].attrs['n_windows']
+                if n_windows == self.windows_per_subject:
+                    valid_subjects.append(subj)
+        
+        # LOSO-CV 划分
+        if self.test_subject is None:
+            raise ValueError("test_subject must be specified for LOSO-CV")
+        
+        if self.test_subject not in valid_subjects:
+            raise ValueError(f"Test subject {self.test_subject} not found in valid subjects")
+        
+        # 测试集 = 指定的受试者
+        test_subjects = [self.test_subject]
+        
+        # 训练+验证集 = 其余受试者
+        train_val_subjects = [s for s in valid_subjects if s != self.test_subject]
+        
+        # 从训练+验证集中划分验证集
+        np.random.seed(self.seed)
+        np.random.shuffle(train_val_subjects)
+        n_val = int(len(train_val_subjects) * self.val_ratio)
+        
+        val_subjects = train_val_subjects[:n_val]
+        train_subjects = train_val_subjects[n_val:]
+        
+        # 根据split选择受试者
+        if self.split == 'train':
+            self.subjects = train_subjects
+        elif self.split == 'val':
+            self.subjects = val_subjects
+        else:  # test
+            self.subjects = test_subjects
+        
+        print(f"LOSO-CV split (test_subject={self.test_subject}):")
+        print(f"  {self.split} set: {len(self.subjects)} subjects")
+        
+        # 获取受试者索引
+        self.subject_indices = {}
+        with h5py.File(self.index_file_path, 'r') as f:
+            for subj in self.subjects:
+                indices = f[f'subjects/{subj}/window_indices'][:]
+                if len(indices) == self.windows_per_subject:
+                    self.subject_indices[subj] = indices[0]
+    
+    def __len__(self):
+        return len(self.subjects)
+    
+    def __getitem__(self, idx):
+        subject_id = self.subjects[idx]
+        start_idx = self.subject_indices[subject_id]
+        
+        with h5py.File(self.ppg_file_path, 'r') as f:
+            ppg_windows = f['ppg'][start_idx:start_idx + self.windows_per_subject]
+            labels = f['labels'][start_idx:start_idx + self.windows_per_subject]
+        
+        ppg_continuous = ppg_windows.reshape(-1)
+        
+        if self.transform:
+            ppg_continuous = self.transform(ppg_continuous)
+        
+        ppg_tensor = torch.FloatTensor(ppg_continuous).unsqueeze(0)
+        labels_tensor = torch.LongTensor(labels)
+        
+        return ppg_tensor, labels_tensor
+
+
+def get_loso_dataloaders(data_path, test_subject, batch_size=1, num_workers=0,
+                         val_ratio=0.2, seed=42):
+    """
+    获取 LOSO-CV 数据加载器
+    
+    Args:
+        data_path: 数据路径
+        test_subject: 测试受试者ID
+        batch_size: 批大小
+        num_workers: 工作进程数
+        val_ratio: 验证集比例
+        seed: 随机种子
+    
+    Returns:
+        train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset
+    """
+    train_dataset = LOSO_PPGOnlyDataset(
+        data_path, split='train', test_subject=test_subject,
+        val_ratio=val_ratio, seed=seed
+    )
+    val_dataset = LOSO_PPGOnlyDataset(
+        data_path, split='val', test_subject=test_subject,
+        val_ratio=val_ratio, seed=seed
+    )
+    test_dataset = LOSO_PPGOnlyDataset(
+        data_path, split='test', test_subject=test_subject,
+        val_ratio=val_ratio, seed=seed
+    )
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size,
+        shuffle=True, num_workers=num_workers,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size,
+        shuffle=False, num_workers=num_workers,
+        pin_memory=True
+    )
+    
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size,
+        shuffle=False, num_workers=num_workers,
+        pin_memory=True
+    )
+    
+    return train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset
+
+
+def get_all_subjects(data_path):
+    """获取所有有效受试者列表"""
+    if isinstance(data_path, dict):
+        index_file_path = data_path['index']
+    else:
+        index_file_path = os.path.join(data_path, 'mesa_subject_index.h5')
+    
+    windows_per_subject = 1200
+    
+    with h5py.File(index_file_path, 'r') as f:
+        all_subjects = list(f['subjects'].keys())
+        
+        valid_subjects = []
+        for subj in all_subjects:
+            n_windows = f[f'subjects/{subj}'].attrs['n_windows']
+            if n_windows == windows_per_subject:
+                valid_subjects.append(subj)
+    
+    return sorted(valid_subjects)
+
+
 def verify_test_set():
 
     data_paths = {
