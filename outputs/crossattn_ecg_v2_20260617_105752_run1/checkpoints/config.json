@@ -1,0 +1,33 @@
+{
+  "data": {
+    "ppg_file": "../../data/mesa_ppg_with_labels.h5",
+    "index_file": "../../data/mesa_subject_index.h5",
+    "num_workers": 4
+  },
+  "training": {
+    "batch_size": 2,
+    "num_epochs": 50,
+    "learning_rate": 0.0001,
+    "weight_decay": 1e-05,
+    "patience": 15,
+    "val_ratio": 0.2,
+    "seed": 42
+  },
+  "model": {
+    "d_model": 256,
+    "n_heads": 8,
+    "n_fusion_blocks": 3
+  },
+  "noise_config": {
+    "noise_level": 0.1,
+    "drift_amplitude": 0.1,
+    "drift_frequency": 0.1,
+    "spike_probability": 0.01,
+    "spike_amplitude": 0.5
+  },
+  "output": {
+    "save_dir": "./outputs",
+    "save_frequency": 5
+  },
+  "use_amp": true
+}
